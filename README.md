@@ -244,7 +244,7 @@ argument takes precedence over its corresponding environment variable.
 | `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP` and `CUFILE`; other backends ignore it. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_IO_DEPTH` | Maximum number of rank-local I/O operations in flight. Higher values can increase throughput and staging-memory usage; the maximum is 1024. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Maximum fraction of currently free GPU memory available to the logical device buffer. | `0.5` |
-| `INSTANTTENSOR_HOST_FALLBACK` | Set to `1` to load files whose largest tensor exceeds the device-memory budget through host memory instead of failing (see below). | `0` |
+| `INSTANTTENSOR_TENSOR_DISTRIBUTION_CONFIG` | JSON form of `tensor_distribution_config` (see below), for example `{"\\.engram\\.": {"device": "cpu"}}`. | Unset (every tensor on the `safe_open` device). |
 | `INSTANTTENSOR_CACHE_BUFFER` | Set to `1` to cache pinned host staging buffers across loader opens. Cached memory remains pinned until process cleanup. | `0` |
 | `INSTANTTENSOR_DEBUG` | Set to `1` to print backend selection, buffer sizes, timing, and throughput diagnostics. | `0` |
 
@@ -260,16 +260,9 @@ buffer is shrunk to the budget (less I/O overlap) as long as every tensor on
 the device path still fits; an explicit `buffer_size` that exceeds the budget
 fails before the native allocation is attempted.
 
-A file that contains a single tensor larger than the budget cannot be staged
-through the device ring buffer at all; by default `safe_open` fails and names
-the tensor. With `INSTANTTENSOR_HOST_FALLBACK=1` (or `host_fallback=True`)
-such files are instead loaded into host memory with plain buffered reads and
-their tensors are yielded as CPU tensors, with a `RuntimeWarning` naming the
-files; every other file keeps the device path. Checkpoints that place very
-large embedding or expert tables in dedicated shards (for example
-DeepSeek-V4.1-Flash, whose two 91.6 GiB engram embedding tables each sit in
-their own shard) can then be loaded on devices whose budget is below those
-tensors, as long as the consumer accepts CPU tensors for them.
+A single tensor larger than the budget cannot be staged through the device
+ring buffer at all; `safe_open` fails, names the tensor and suggests the rule
+below.
 
 For example:
 
@@ -278,6 +271,35 @@ INSTANTTENSOR_BACKEND=BUFFERED \
 INSTANTTENSOR_IO_DEPTH=32 \
 INSTANTTENSOR_DEBUG=1 python load_model.py
 ```
+
+### Tensor distribution
+
+`tensor_distribution_config` places individual tensors. It is an ordered
+collection of `(pattern, rule)` entries, given as a `dict` or a list of pairs.
+Each `pattern` is a regular expression matched with `re.search` against the
+tensor name; the first matching entry applies and a name that matches no entry
+keeps the default placement. The only supported rule key for now is `device`:
+`"cpu"` loads the tensor into host memory from a copy-on-write memory map of
+the file instead of through the device ring buffer, and the `safe_open` device
+itself is a no-op.
+
+```python
+with safe_open(files, framework="pt", device=0,
+               tensor_distribution_config={r"\.engram\.": {"device": "cpu"}}) as f:
+    for name, tensor in f.tensors():
+        ...  # tensors matching the rule arrive on the CPU, the rest on cuda:0
+```
+
+CPU tensors never occupy the ring buffer, so the buffer is sized from the
+remaining tensors only. This is how checkpoints with tables too large for any
+single device can be loaded; for example DeepSeek-V4.1-Flash stores two 91.6
+GiB engram embedding tables, larger than the device budget of every current
+GPU, and keeps them CPU-resident at runtime anyway. CPU tensors honour `copy`:
+owned memory with `copy=True`, zero-copy views of the mapping with
+`copy=False` (a view keeps its mapping alive while it exists). The same config
+can be given as JSON in `INSTANTTENSOR_TENSOR_DISTRIBUTION_CONFIG`, either as an
+object or as a list of `[pattern, rule]` pairs; an explicit argument takes
+precedence.
 
 ## API reference
 
